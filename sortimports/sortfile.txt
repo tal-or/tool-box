@@ -1,0 +1,11 @@
+// each line in the sortfile represents a prefix for a set of imports and an index on which the set should be located.
+// there should be no more than a single sortfile for a project
+// std is a reserved word for standard libraries
+// default is a reserved word for libs that are matching none of the prefixes
+
+1 std
+2 "k8s.io"
+3 "sigs.k8s.io"
+4 default
+5 "github.com/openshift"
+6 "github.com/openshift-kni"

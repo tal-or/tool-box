@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -38,60 +39,106 @@ import (
 type Args struct {
 	Paths       []string
 	ExcludeDirs sets.Set[string]
+	SortGroups  []SortGroup
 	Verbose     bool
 }
 
-// Sorts imports based on:
+// SortGroup is a group that collect a list imports based on specific Prefix
+// Index used to mark the place of the group in the order
+type SortGroup struct {
+	Index  int
+	Prefix string
+}
+
+type Libs struct {
+	sortGroup  SortGroup
+	importSpec []*ast.ImportSpec
+}
+
+// Imports sorting is based on the configuration provided by the sortfile.
+// The default is:
 // 1. Standard libraries
 // 2. "k8s.io" imports
 // 3. "sigs.k8s.io" imports
 // 4. Other third-party libraries
 // 5. "github.com/openshift" imports
 // 6. "github.com/openshift-kni" imports
+//
 // Custom sorting function for import specs
-func sortImports(imports []*ast.ImportSpec) []*ast.ImportSpec {
-	var stdLibs, k8sLibs, thirdParty, openShiftLibs, openshiftKniLibs []*ast.ImportSpec
+func sortImports(imports []*ast.ImportSpec, sortGroups []SortGroup) []*ast.ImportSpec {
+	libsMap := makeLibsMap(sortGroups)
 
-	for _, imp := range imports {
-		path := strings.Trim(imp.Path.Value, `"`)
-		switch {
-		case isStdLib(path):
-			stdLibs = append(stdLibs, imp)
-		case strings.HasPrefix(path, "k8s.io") || strings.HasPrefix(path, "sigs.k8s.io"):
-			k8sLibs = append(k8sLibs, imp)
-		case strings.HasPrefix(path, "github.com/openshift-kni"):
-			openshiftKniLibs = append(openshiftKniLibs, imp)
-		case strings.HasPrefix(path, "github.com/openshift"):
-			openShiftLibs = append(openShiftLibs, imp)
-		default:
-			thirdParty = append(thirdParty, imp)
-		}
+	sortImport(libsMap, imports, 0)
+
+	for _, libs := range libsMap {
+		// Sort each group while keeping original comments and aliases
+		sort.Slice(libs.importSpec, func(i, j int) bool { return libs.importSpec[i].Path.Value < libs.importSpec[j].Path.Value })
 	}
 
-	// Sort each group while keeping original comments and aliases
-	sort.Slice(stdLibs, func(i, j int) bool { return stdLibs[i].Path.Value < stdLibs[j].Path.Value })
-	sort.Slice(k8sLibs, func(i, j int) bool { return k8sLibs[i].Path.Value < k8sLibs[j].Path.Value })
-	sort.Slice(thirdParty, func(i, j int) bool { return thirdParty[i].Path.Value < thirdParty[j].Path.Value })
-	sort.Slice(openShiftLibs, func(i, j int) bool { return openShiftLibs[i].Path.Value < openShiftLibs[j].Path.Value })
-	sort.Slice(openshiftKniLibs, func(i, j int) bool { return openshiftKniLibs[i].Path.Value < openshiftKniLibs[j].Path.Value })
+	// sort by index
+	var specs = make([][]*ast.ImportSpec, len(libsMap))
+	for _, libs := range libsMap {
+		specs[libs.sortGroup.Index-1] = libs.importSpec
+	}
 
 	// Reconstruct sorted import block
 	var sortedImports []*ast.ImportSpec
-	sortedImports = append(sortedImports, stdLibs...)
-	if len(k8sLibs) > 0 {
-		sortedImports = append(sortedImports, k8sLibs...)
+	for _, spec := range specs {
+		if len(spec) > 0 {
+			sortedImports = append(sortedImports, spec...)
+			sortedImports = append(sortedImports, newLine())
+		}
 	}
-	if len(thirdParty) > 0 {
-		sortedImports = append(sortedImports, thirdParty...)
+	return sortedImports
+}
+
+func newLine() *ast.ImportSpec {
+	return &ast.ImportSpec{
+		Path:    &ast.BasicLit{Kind: token.STRING, Value: ``},
+		Comment: &ast.CommentGroup{List: []*ast.Comment{{Text: "// blank line"}}},
 	}
-	if len(openShiftLibs) > 0 {
-		sortedImports = append(sortedImports, openShiftLibs...)
+}
+
+func sortImport(libsMap map[string]*Libs, imports []*ast.ImportSpec, i int) {
+	if i >= len(imports) {
+		return
 	}
-	if len(openshiftKniLibs) > 0 {
-		sortedImports = append(sortedImports, openshiftKniLibs...)
+	path := strings.Trim(imports[i].Path.Value, `"`)
+	for prefix, libs := range libsMap {
+		if strings.HasPrefix(path, prefix) {
+			libs.importSpec = append(libs.importSpec, imports[i])
+			sortImport(libsMap, imports, i+1)
+			return
+		}
 	}
 
-	return sortedImports
+	if _, ok := libsMap["std"]; ok && isStdLib(path) {
+		libsMap["std"].importSpec = append(libsMap["std"].importSpec, imports[i])
+	} else {
+		libsMap["default"].importSpec = append(libsMap["default"].importSpec, imports[i])
+	}
+
+	sortImport(libsMap, imports, i+1)
+}
+
+func makeLibsMap(groups []SortGroup) map[string]*Libs {
+	libs := make(map[string]*Libs, len(groups))
+	for _, group := range groups {
+		libs[group.Prefix] = &Libs{
+			sortGroup:  group,
+			importSpec: []*ast.ImportSpec{},
+		}
+	}
+	// add default if not exist
+	if _, ok := libs["default"]; !ok {
+		libs["default"] = &Libs{
+			sortGroup: SortGroup{
+				Index: len(groups) + 1,
+			},
+			importSpec: []*ast.ImportSpec{},
+		}
+	}
+	return libs
 }
 
 // Determines if a package is a standard library package
@@ -101,7 +148,7 @@ func isStdLib(pkg string) bool {
 }
 
 // Process the file while preserving alias & comments in imports
-func processFile(src []byte) ([]byte, error) {
+func processFile(src []byte, groups []SortGroup) ([]byte, error) {
 	// Parse the file
 	fset := token.NewFileSet()
 	node, err := parser.ParseFile(fset, "", src, parser.ParseComments)
@@ -129,7 +176,7 @@ func processFile(src []byte) ([]byte, error) {
 	}
 
 	// Sort imports
-	sortedImports := sortImports(imports)
+	sortedImports := sortImports(imports, groups)
 
 	// Replace original imports with sorted ones
 	importDecl.Specs = nil
@@ -177,7 +224,7 @@ func main() {
 				return fmt.Errorf("failed to read file: %w", err2)
 			}
 
-			sortedSrc, err2 := processFile(src)
+			sortedSrc, err2 := processFile(src, progArgs.SortGroups)
 			if err2 != nil {
 				return fmt.Errorf("failed to sort imports: %w", err2)
 			}
@@ -200,6 +247,7 @@ func parseFlags(args []string) (*Args, error) {
 	}
 	paths := flag.String("paths", "", "Path to files to be sorted, multiple paths can be provided.")
 	excludeDirs := flag.String("exclude-dirs", "", "Directory names that should be excluded from imports, multiple directories can be provided.")
+	path := flag.String("sort-file-path", "sortfile.txt", "A path to file of list of prefixes and indexes on which the tool will based its sorting")
 	flag.BoolVar(&progArgs.Verbose, "verbose", false, "Verbose output")
 	flag.Parse()
 
@@ -210,7 +258,52 @@ func parseFlags(args []string) (*Args, error) {
 	if err := prepExcludeDirs(*excludeDirs, progArgs); err != nil {
 		return nil, err
 	}
+
+	if err := prepSortGroups(*path, progArgs); err != nil {
+		return nil, err
+	}
+
 	return progArgs, nil
+}
+
+func prepSortGroups(path string, progArgs *Args) error {
+	file, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	progArgs.SortGroups, err = parseSortFile(file)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseSortFile(data []byte) ([]SortGroup, error) {
+	var err error
+	var groups []SortGroup
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		group := SortGroup{}
+		// skip for comments
+		if strings.HasPrefix(line, "//") {
+			continue
+		}
+
+		indexAndPrefix := strings.Split(line, " ")
+		// skip on invalid formats
+		if len(indexAndPrefix) != 2 {
+			continue
+		}
+
+		index := indexAndPrefix[0]
+		group.Index, err = strconv.Atoi(index)
+		if err != nil {
+			return nil, fmt.Errorf("%s must be a valid number; %w", indexAndPrefix, err)
+		}
+		group.Prefix = indexAndPrefix[1]
+		groups = append(groups, group)
+	}
+	return groups, nil
 }
 
 func prepPaths(paths string, progArgs *Args) error {
